@@ -2,8 +2,8 @@
 
 #include <Arduino.h>
 #include <Mesh.h>
-#include "AbstractUITask.h"
 #include <helpers/ui/DisplayDriver.h>
+#include "Features.h"   // FEAT_RX_POWERSAVE, used by MyMesh.cpp
 
 // Forward declaration for UITask
 class UITask;
@@ -37,7 +37,7 @@ class UITask;
 #elif defined(RP2040_PLATFORM)
 #include <LittleFS.h>
 #elif defined(ESP32)
-#include <SPIFFS.h>
+#include <helpers/esp32/InternalFS.h>
 #endif
 
 #include "DataStore.h"
@@ -106,29 +106,106 @@ struct DiscoverResult {
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
 public:
-  MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
+  // Everything MyMesh tells the on-device UI goes through this one interface
+  // (set with setListener()); MyMesh itself has no UI concepts. The first
+  // block mirrors upstream meshcore-dev/MeshCore's MyMesh::Listener (PR #3431
+  // and follow-ups) with identical names/signatures, so upstream merges stay
+  // mechanical. The second block is this fork's extensions -- events and
+  // device controls upstream doesn't have (yet). Every method there defaults
+  // to a no-op, so an upstream-style listener still works unchanged.
+  class Listener {
+    public:
+      // ---- upstream MyMesh::Listener ----
+      virtual void onMessageRecv(mesh::Packet *pkt, const ContactInfo &from, uint8_t txt_type, uint32_t sender_timestamp, const char* text) = 0;
+      virtual void onChannelMessageRecv(mesh::Packet *pkt, ChannelDetails& channel_details, const char* text) = 0;
+      virtual void onQueueSizeChanged(int msgcount) = 0;
+      virtual void onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path_len, const uint8_t* path) { }
+      virtual void onControlDataRecv(const mesh::Packet* pkt) { }
+      virtual void onChannelDataRecv(mesh::Packet *pkt, const mesh::GroupChannel &channel, uint16_t data_type,
+                                     const uint8_t *data, size_t data_len) { }
+      virtual void onACKRecv(uint32_t ack_crc) { }
+      virtual uint8_t onUnhandledRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
+                                         uint8_t len, uint8_t *reply) { return 0; /* unknown request type */ }
+      virtual void onUnhandledResponse(const ContactInfo &from, uint32_t tag, const uint8_t* data, uint8_t len) { }
+      virtual void onTraceRecv(mesh::Packet *pkt, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                               const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) { }
+      virtual void onRawDataRecv(mesh::Packet *pkt) { }
+      virtual ~Listener() { }
 
-  void begin(bool has_display);
+      // ---- Solo fork extensions ----
+      // onMessageRecv() plus the signed-message author prefix (a room post's
+      // real author; extra_len 0 otherwise). MyMesh calls this one; the
+      // default forwards to the upstream method.
+      virtual void onMessageRecvEx(mesh::Packet *pkt, const ContactInfo &from, uint8_t txt_type, uint32_t sender_timestamp,
+                                   const uint8_t* extra, int extra_len, const char* text) {
+        onMessageRecv(pkt, from, txt_type, sender_timestamp, text);
+      }
+      // onChannelMessageRecv() plus the channel slot and sender timestamp.
+      virtual void onChannelMessageRecvEx(mesh::Packet *pkt, uint8_t channel_idx, ChannelDetails& channel_details,
+                                          uint32_t timestamp, const char* text) {
+        onChannelMessageRecv(pkt, channel_details, text);
+      }
+      // Any advert heard (contact or discover response) -- sound/notify hook.
+      virtual void onAdvertHeard(bool was_flood) { }
+      // Our own channel send (app, bot) to mirror into on-device history.
+      // Returns the history ring position, or -1 if none is kept.
+      virtual int addChannelMsg(uint8_t channel_idx, const char* text, uint32_t timestamp = 0,
+                                const uint8_t* path = nullptr, uint8_t path_len = 0,
+                                bool own_message = false) { return -1; }
+      // Mirror of our own channel post, framed "Me: " (see MessagesScreen).
+      // text_len < 0: text is null-terminated; otherwise only text_len bytes.
+      int addOwnChannelMsg(uint8_t channel_idx, const char* text, int text_len = -1, uint32_t timestamp = 0) {
+        char buf[MAX_TEXT_LEN + 8];   // "Me: "(4) + text(MAX_TEXT_LEN) + margin
+        if (text_len < 0) snprintf(buf, sizeof(buf), "Me: %s", text);
+        else              snprintf(buf, sizeof(buf), "Me: %.*s", text_len, text);
+        return addChannelMsg(channel_idx, buf, timestamp, nullptr, 0, true);
+      }
+      // Arm the "relayed into mesh" tracker on ring position pos (seq:
+      // lastChannelRelaySeq()), and report each repeater echo heard for it.
+      virtual void armChannelRelay(int pos, uint32_t seq) { }
+      virtual void onChannelRelayed(uint32_t seq, const uint8_t* repeater_hash = nullptr, uint8_t hash_size = 0) { }
+      // DM history entry: incoming (path = route taken) or our own outgoing
+      // send from the app/bot (ack_tag/ack_deadline_ms drive the marker).
+      virtual void addDMMsg(const uint8_t* pub_key, bool outgoing, const char* text, uint32_t sender_timestamp = 0,
+                            uint32_t ack_tag = 0, uint32_t ack_deadline_ms = 0, uint8_t resends = 0,
+                            const uint8_t* path = nullptr, uint8_t path_len = 0) { }
+      // Results of on-device-UI-initiated requests (sendRoomLogin/sendAdminCommand).
+      virtual void onRoomLoginResult(const uint8_t* pub_key, bool success, uint8_t permissions) { }
+      virtual void onAdminReply(const uint8_t* pub_key, const char* text) { }
+      // A [LOC] share (pub_key set = verified DM; null = channel/room, by name).
+      virtual void onSharedLocation(const uint8_t* pub_key, const char* name,
+                                    int32_t lat_1e6, int32_t lon_1e6, uint32_t ts, bool verified) { }
+      // A contact / channel slot is gone -- drop references to it.
+      virtual void onContactRemoved(const uint8_t* pub_key) { }
+      virtual void onChannelRemoved(uint8_t channel_idx) { }
+      // Remote bot device actions (!gps/!buzz/!gpioN), gated by bot_actions_* prefs.
+      virtual void botSetGPS(bool on) { }
+      virtual void botBuzz(int seconds) { }
+      virtual bool botSetGPIO(int idx, bool on) { return false; }
+      virtual bool botGetGPIO(int idx, bool& is_output, bool& value) { return false; }
+      virtual bool botGetGPIOAnalog(int idx, int& millivolts) { return false; }
+      // Controlled reboot/power-off (CLI/app "reboot"): the listener flushes
+      // its state and restarts. Returns false if it doesn't handle it, and
+      // MyMesh then flushes and reboots by itself.
+      virtual bool requestShutdown(bool restart) { return false; }
+  };
+
+  MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store);
+
+  void begin();
+  void setListener(Listener* listener) { _listener = listener; }
+  Listener* getListener() const { return _listener; }
   void startInterface(BaseSerialInterface &serial);
 
   const char *getNodeName();
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
+  void setBLEPin(uint32_t active_pin);
 
   void loop();
   void handleCmdFrame(size_t len);
-  bool advert();
-#ifdef SIM_PLATFORM
-  // Phase 3 sim-only test hook: same as advert() but FLOOD-routed (like the
-  // real phone-app CMD_SEND_SELF_ADVERT command's flood=1 branch) instead of
-  // zero-hop, so a JS test harness can make an instance's identity actually
-  // propagate through an intermediate repeater instance -- advert() alone
-  // (zero-hop) never leaves the immediate ether link. Not reachable from any
-  // real hardware build (no phone app exists in the sim to send the real
-  // CMD_SEND_SELF_ADVERT command over), so this is additive/dead code
-  // everywhere else, not a behavior change.
-  bool advertFlood();
-#endif
+  bool advert();        // zero-hop: only nodes in direct range hear it
+  bool advertFlood();   // flooded (default scope), as the app's "Advert" with flood
   void sendNodeDiscoverReq();
   void enterCLIRescue();
 
@@ -169,13 +246,24 @@ public:
     bool received;
     unsigned long sent_ms;
   };
+
+  struct BotTracePending {
+    bool active;
+    bool queued;
+    uint32_t tag;
+    uint32_t started_ms;
+    uint8_t reply_kind;   // 1=DM, 2=channel, 3=room
+    uint8_t channel_idx;
+    uint8_t target_pubkey[PUB_KEY_SIZE];
+    uint8_t reply_pubkey[PUB_KEY_SIZE];
+    char target_name[32];
+  };
   
   uint32_t sendPing(const uint8_t* dest_pubkey, uint8_t hash_width = 1);
   void setPingCallback(PingCallback cb, void* arg);
   void clearPingResult(uint32_t tag);
   PingResult* getPingResult(uint32_t tag);
   PingCallback getPingCallback() const { return _ping_callback; }
-  AbstractUITask* getUITask() const { return _ui; }
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -256,11 +344,13 @@ public:
   // GroupChannel&, ...) already calls trackRelaySend() unconditionally, so
   // lastChannelRelaySeq() is already the seq for the send just made.
   int mirrorOwnChannelMsg(uint8_t channel_idx, const char* text, int text_len = -1, uint32_t timestamp = 0) {
-    if (!_ui) return -1;
-    int pos = _ui->addOwnChannelMsg(channel_idx, text, text_len, timestamp);
-    if (pos >= 0) _ui->armChannelRelay(pos, lastChannelRelaySeq());
+    if (!_listener) return -1;
+    int pos = _listener->addOwnChannelMsg(channel_idx, text, text_len, timestamp);
+    if (pos >= 0) _listener->armChannelRelay(pos, lastChannelRelaySeq());
     return pos;
   }
+  // Queue a locally generated channel post for the companion app to sync.
+  void notifyAppOfOwnChannelMsg(uint8_t channel_idx, const char* text, uint32_t timestamp);
 private:
 
   // DataStoreHost methods
@@ -278,7 +368,7 @@ public:
   // The room server's ACL grants permission per-identity (self_id), not per
   // command source, so this reuses the same sendLogin() the BLE CMD_SEND_LOGIN
   // path uses; the async result lands in onContactResponse() and is pushed to
-  // the UI via AbstractUITask::onRoomLoginResult().
+  // the UI via Listener::onRoomLoginResult().
   bool sendRoomLogin(const ContactInfo& contact, const char* password, uint32_t& est_timeout) {
     if (sendLogin(contact, password, est_timeout) == MSG_SEND_FAILED) return false;
     clearPendingReqs();
@@ -396,6 +486,12 @@ public:
   // MyMesh -- edits go through setPrimaryScope()/addScope()/setChannelScope()/
   // setDefaultScope() so repeat_scopes[]/persistence stay in sync.
   const ScopeList& scopeList() const { return _scope_list; }
+  // Force the scope of the NEXT sends to list index idx (0 = "*", unscoped),
+  // beating the app's send_scope/send_unscoped and a channel's own pick, until
+  // clearOneShotScope(). Bracket a synchronous send with these -- used by Live
+  // Share so its [LOC] posts can go to a different region than the chat does.
+  void setOneShotScope(uint8_t idx) { _oneshot_scope = _scope_list.key(idx); _oneshot_scope_on = true; }
+  void clearOneShotScope() { _oneshot_scope_on = false; }
   // Adds a new named entry (see ScopeList::add()), persists the list, and
   // returns its list index (0 if the name's empty or the list's full).
   uint8_t addScope(const char* name);
@@ -445,14 +541,21 @@ public:
   bool isGpsFixPending() const { return _loc_fix.active; }
 
 private:
-  void tryBotReplyDM(const ContactInfo& from, const char* text, uint8_t hops);
-  void tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t hops);
-  void tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops);
-  bool tryBotCommand(const ContactInfo& from, const char* text, uint8_t hops);          // DM commands
-  bool tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t hops);       // channel commands
-  bool tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops); // room commands
-  bool botCommandReply(const char* cmd, const char* arg, const char* arg2, bool actions_allowed, uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name);  // one command → reply text
-  int  botScanCommands(const char* body, uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name, bool actions_allowed); // scan "!word"s → combined reply, returns count
+  void tryBotReplyDM(const ContactInfo& from, const char* text, uint8_t hops, const mesh::Packet* pkt);
+  void tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t hops, const mesh::Packet* pkt);
+  void tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops, const mesh::Packet* pkt);
+  void botFormatPath(const mesh::Packet* pkt, char* out, int out_len);
+  void botFormatTracePath(const uint8_t* hashes, const uint8_t* snrs, uint8_t path_len, uint8_t hash_size, char* out, int out_len);
+  bool tryBotCommand(const ContactInfo& from, const char* text, uint8_t hops, const mesh::Packet* pkt);          // DM commands
+  bool tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t hops, const mesh::Packet* pkt);       // channel commands
+  bool tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops, const mesh::Packet* pkt); // room commands
+  bool botCommandReply(const char* cmd, const char* arg, const char* arg2, bool actions_allowed, uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name, const mesh::Packet* pkt, const ContactInfo* trace_target, uint8_t reply_kind, const uint8_t* reply_pubkey, uint8_t reply_channel_idx);  // one command → reply text
+  int  botScanCommands(const char* body, uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name, bool actions_allowed, const mesh::Packet* pkt, const ContactInfo* trace_target, uint8_t reply_kind, const uint8_t* reply_pubkey, uint8_t reply_channel_idx); // scan commands → combined reply
+  ContactInfo* botFindContactPrefixCI(const char* name_prefix);
+  void botCompleteTrace(uint32_t tag, const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len, uint8_t flags, int16_t snr_out_x4, int16_t snr_back_x4, uint32_t rtt_ms);
+  void tickBotTrace();
+  bool botStartQueuedTrace();
+  void botCancelQueuedTrace();
   // !gps fix -- single-shot "wait for a stabilised GPS fix, then push a follow-up
   // message" action. botCommandReply() only sets _locfix_requested (it doesn't know
   // the destination); the tryBot*Command() wrappers call startLocFix() with the
@@ -497,7 +600,8 @@ private:
   bool isValidClientRepeatFreq(uint32_t f) const;
 #ifdef ENABLE_SCREENSHOT
   void handleScreenshotRequest();
-  void sendScreenshotResponse(DisplayDriver* display, const uint8_t* buffer, uint16_t bufferSize);
+  void sendScreenshotResponse(uint8_t displayType, uint8_t rotation, uint16_t width, uint16_t height,
+                              const uint8_t* buffer, uint32_t bufferSize);
 #endif
 
   // helpers, short-cuts
@@ -514,7 +618,7 @@ private:
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ
   BaseSerialInterface *_serial;
-  AbstractUITask* _ui;
+  Listener* _listener;
 
   ContactsIterator _iter;
   uint32_t _iter_filter_since;
@@ -551,6 +655,7 @@ private:
   uint8_t app_target_ver;
   uint8_t *sign_data;
   uint32_t sign_data_len;
+  uint32_t sign_data_cap;   // what the malloc got: at most MAX_SIGN_DATA_LEN
   unsigned long dirty_contacts_expiry;
   unsigned long _bot_last_ch_reply_ms;
   unsigned long _bot_last_room_reply_ms;
@@ -610,6 +715,8 @@ private:
   void resetPendingBotActions();
 
   TransportKey send_scope;
+  TransportKey _oneshot_scope;      // see setOneShotScope()
+  bool         _oneshot_scope_on = false;
 
   // The shared named-scope list backing Settings > Radio > Scope, the
   // channel context menu's Scope: row, and Tools > Repeater > Extra scopes.
@@ -670,8 +777,13 @@ private:
 
   // ── Ping/Trace state ──────────────────────────────────────────────────────
   PingResult _ping_results[PING_RESULT_MAX];
+  BotTracePending _bot_trace_pending;
   PingCallback _ping_callback;
   void* _ping_callback_arg;
 };
 
+#if defined(MESH_IN_PSRAM) && defined(ESP32)
+extern MyMesh& the_mesh;   // allocated in PSRAM, see main.cpp
+#else
 extern MyMesh the_mesh;
+#endif

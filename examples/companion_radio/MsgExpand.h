@@ -4,6 +4,7 @@
 #include <ctime>
 #include <cstdint>
 #include <helpers/SensorManager.h>
+#include "NodePrefs.h"   // localTm()
 #include <helpers/sensors/LPPDataHelpers.h>
 
 // Expands placeholders in tmpl into out (out_len bytes).
@@ -18,14 +19,20 @@
 //   {dist}  — distance m               (requires sm)
 //   {co2}   — CO2 concentration ppm    (requires sm)
 //   {name}  — sender's name (bot replies only; requires sender_name, else left literal)
-//   {hops}  — hop count: "direct" or "N hops" (bot replies only; requires hops>=0, else left literal)
+//   {hops}  — hop count: "direct" or N (bot replies only; requires hops>=0, else left literal)
+//   {snr}   — SNR of the received message in dB (bot replies only)
+//   {rssi}  — RSSI of the received message in dBm (bot replies only)
+//   {path}  — route as repeater names/hashes separated by > (bot replies only)
 inline void expandMsg(const char* tmpl, char* out, int out_len,
                       double lat, double lon, bool gps_valid,
                       uint32_t utc_ts, int8_t tz_hours,
                       SensorManager* sm = nullptr,
                       float batt_volts  = -1.0f,
                       const char* sender_name = nullptr,
-                      int hops = -1) {
+                      int hops = -1,
+                      float rx_snr = -999.0f,
+                      float rx_rssi = -999.0f,
+                      const char* rx_path = nullptr) {
   // sv indices: 0=temp 1=hum 2=pres 3=batt 4=alt 5=lux 6=dist 7=co2
   float sv[8]    = {};
   bool  sv_ok[8] = {};
@@ -85,12 +92,10 @@ inline void expandMsg(const char* tmpl, char* out, int out_len,
       else           strcpy(lb, "no GPS");
       APPEND(lb, strlen(lb)); p += 5;
     } else if (strncmp(p, "{time}", 6) == 0) {
-      if (utc_ts > 1000000000UL) {
-        uint32_t local_ts = utc_ts + (int32_t)tz_hours * 3600;
-        time_t t = (time_t)local_ts;
-        struct tm* ti = gmtime(&t);
+      struct tm ti;
+      if (localTm(utc_ts, tz_hours, ti)) {
         char tb[8];
-        snprintf(tb, sizeof(tb), "%02d:%02d", ti->tm_hour, ti->tm_min);
+        snprintf(tb, sizeof(tb), "%02d:%02d", ti.tm_hour, ti.tm_min);
         APPEND(tb, strlen(tb));
       }
       p += 6;
@@ -134,9 +139,21 @@ inline void expandMsg(const char* tmpl, char* out, int out_len,
       if (hops >= 0) {
         char b[10];
         if (hops == 0) strcpy(b, "direct");
-        else           snprintf(b, sizeof(b), "%u hops", (unsigned)hops);
+        else           snprintf(b, sizeof(b), "%u", (unsigned)hops);
         APPEND(b, strlen(b));
       } else { APPEND("{hops}", 6); }
+      p += 6;
+    } else if (strncmp(p, "{snr}", 5) == 0) {
+      if (rx_snr > -999.0f) { char b[12]; snprintf(b, sizeof(b), "%.1fdB", rx_snr); APPEND(b, strlen(b)); }
+      else { APPEND("{snr}", 5); }
+      p += 5;
+    } else if (strncmp(p, "{rssi}", 6) == 0) {
+      if (rx_rssi > -999.0f) { char b[12]; snprintf(b, sizeof(b), "%.0fdBm", rx_rssi); APPEND(b, strlen(b)); }
+      else { APPEND("{rssi}", 6); }
+      p += 6;
+    } else if (strncmp(p, "{path}", 6) == 0) {
+      if (rx_path && rx_path[0]) { APPEND(rx_path, strlen(rx_path)); }
+      else { APPEND("{path}", 6); }
       p += 6;
     } else {
       out[oi++] = *p++;

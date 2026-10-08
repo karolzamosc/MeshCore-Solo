@@ -83,6 +83,78 @@ void MyMesh::botChannelSenderSplit(const char* text, char* sender_name, int send
   }
 }
 
+// Render packet path hashes as hex IDs so repeater contact names cannot
+// silently replace the actual hop identifiers.
+void MyMesh::botFormatPath(const mesh::Packet* pkt, char* out, int out_len) {
+  if (!out || out_len <= 0) return;
+  out[0] = '\0';
+  if (!pkt || pkt->getPathHashCount() == 0) {
+    snprintf(out, out_len, "direct");
+    return;
+  }
+  const uint8_t count = pkt->getPathHashCount();
+  const uint8_t hash_size = pkt->getPathHashSize();
+  int used = 0;
+  for (uint8_t hop = 0; hop < count && used < out_len - 1; hop++) {
+    if (hop > 0) {
+      int n = snprintf(out + used, out_len - used, ">");
+      if (n < 0 || n >= out_len - used) break;
+      used += n;
+    }
+    const uint8_t* hash = &pkt->path[(size_t)hop * hash_size];
+    for (uint8_t b = 0; b < hash_size && used < out_len - 2; b++) {
+      int n = snprintf(out + used, out_len - used, "%02X", hash[b]);
+      if (n < 0 || n >= out_len - used) break;
+      used += n;
+    }
+  }
+}
+
+ContactInfo* MyMesh::botFindContactPrefixCI(const char* prefix) {
+  if (!prefix || !prefix[0]) return nullptr;
+  size_t n = strlen(prefix);
+  ContactInfo candidate;
+  for (uint32_t i = 0; i < (uint32_t)getTotalContactSlots(); i++) {
+    if (!getContactByIdx(i, candidate) || candidate.type == ADV_TYPE_NONE || strlen(candidate.name) < n) continue;
+    size_t j = 0;
+    for (; j < n; j++) {
+      if (tolower((uint8_t)candidate.name[j]) != tolower((uint8_t)prefix[j])) break;
+    }
+    if (j == n) return lookupContactByPubKey(candidate.id.pub_key, PUB_KEY_SIZE);
+  }
+  return nullptr;
+}
+
+void MyMesh::botFormatTracePath(const uint8_t* hashes, const uint8_t* snrs, uint8_t path_len,
+                                uint8_t hash_size, char* out, int out_len) {
+  if (!out || out_len <= 0) return;
+  out[0] = '\0';
+  if (!hashes || hash_size == 0 || path_len == 0) {
+    snprintf(out, out_len, "direct");
+    return;
+  }
+  uint8_t count = path_len / hash_size;
+  int used = 0;
+  for (uint8_t hop = 0; hop < count && used < out_len - 1; hop++) {
+    if (hop > 0) {
+      int n = snprintf(out + used, out_len - used, ">");
+      if (n < 0 || n >= out_len - used) break;
+      used += n;
+    }
+    const uint8_t* hash = hashes + (size_t)hop * hash_size;
+    for (uint8_t b = 0; b < hash_size && used < out_len - 2; b++) {
+      int n = snprintf(out + used, out_len - used, "%02X", hash[b]);
+      if (n < 0 || n >= out_len - used) break;
+      used += n;
+    }
+    if (snrs && hop < count && used < out_len - 1) {
+      int n = snprintf(out + used, out_len - used, "@%.1f", ((int8_t)snrs[hop]) / 4.0f);
+      if (n < 0 || n >= out_len - used) break;
+      used += n;
+    }
+  }
+}
+
 // Per-contact DM throttle: true if enough time has passed (or we've never
 // replied) to this contact. Only the first 4 key bytes are compared — ample to
 // tell local contacts apart.
@@ -123,17 +195,12 @@ void MyMesh::botDmRecord(const uint8_t* pubkey) {
 // width window (start == end) disables the feature; a window where start > end
 // wraps past midnight.
 bool MyMesh::botInQuietHours() const {
-  if (_prefs.bot_quiet_start == _prefs.bot_quiet_end) return false;  // disabled
-  uint32_t utc = getRTCClock()->getCurrentTime();
-  if (utc < 1000000000UL) return false;             // clock not set — don't suppress
-  uint32_t local = utc + (int32_t)_prefs.tz_offset_hours * 3600;
-  int h = (int)((local / 3600) % 24);
-  int s = _prefs.bot_quiet_start, e = _prefs.bot_quiet_end;
-  return (s < e) ? (h >= s && h < e)                // same-day window
-                 : (h >= s || h < e);               // overnight window
+  int h;
+  if (!localHour(getRTCClock()->getCurrentTime(), _prefs.tz_offset_hours, h)) return false;   // clock not set -- don't suppress
+  return hourInWindow(h, _prefs.bot_quiet_start, _prefs.bot_quiet_end);
 }
 
-void MyMesh::tryBotReplyDM(const ContactInfo& from, const char* text, uint8_t hops) {
+void MyMesh::tryBotReplyDM(const ContactInfo& from, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   if (from.type != ADV_TYPE_CHAT) return;
   if (!(_prefs.bot_enabled && _prefs.bot_reply_dm[0])) return;
   if (!botDmSenderAllowed(from)) return;
@@ -143,23 +210,26 @@ void MyMesh::tryBotReplyDM(const ContactInfo& from, const char* text, uint8_t ho
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char expanded[BOT_SCRATCH];
+  char path[128];
+  botFormatPath(pkt, path, sizeof(path));
   expandMsg(_prefs.bot_reply_dm, expanded, sizeof(expanded),
             sensors.node_lat, sensors.node_lon,
             sensors.node_lat != 0.0 || sensors.node_lon != 0.0,
             ts, _prefs.tz_offset_hours,
             &sensors, (float)board.getBattMilliVolts() / 1000.0f,
-            from.name, hops);
+            from.name, hops, pkt ? pkt->getSNR() : -999.0f,
+            pkt ? _radio->getLastRSSI() : -999.0f, path);
   uint32_t expected_ack, est_timeout;
   if (sendMessage(from, ts, 0, expanded, expected_ack, est_timeout) != MSG_SEND_FAILED) {
     botDmRecord(from.id.pub_key);
     _bot_reply_count++;
 #ifdef DISPLAY_CLASS
-    if (_ui) _ui->addDMMsg(from.id.pub_key, true, expanded);
+    if (_listener) _listener->addDMMsg(from.id.pub_key, true, expanded);
 #endif
   }
 }
 
-void MyMesh::tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t hops) {
+void MyMesh::tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   // bot_channel_enabled is this target's own on/off switch — independent of
   // bot_enabled (the DM tab's Enable), matching how the commands paths and
   // the tabbed BotScreen UI already treat DM/channel/room as separate targets.
@@ -184,12 +254,15 @@ void MyMesh::tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t h
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char expanded[BOT_SCRATCH];
+  char path[128];
+  botFormatPath(pkt, path, sizeof(path));
   expandMsg(_prefs.bot_reply_ch, expanded, sizeof(expanded),
             sensors.node_lat, sensors.node_lon,
             sensors.node_lat != 0.0 || sensors.node_lon != 0.0,
             ts, _prefs.tz_offset_hours,
             &sensors, (float)board.getBattMilliVolts() / 1000.0f,
-            sender_name, hops);
+            sender_name, hops, pkt ? pkt->getSNR() : -999.0f,
+            pkt ? _radio->getLastRSSI() : -999.0f, path);
   // Anti-loop: don't echo a message identical to our own reply (e.g. another bot
   // on the channel sending the same text), which would ping-pong forever. The
   // per-channel cooldown caps any residual back-and-forth between mismatched bots.
@@ -198,6 +271,7 @@ void MyMesh::tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t h
   if (sendGroupMessage(ts, ch.channel, _prefs.node_name, expanded, rlen)) {
     _bot_last_ch_reply_ms = millis();
     _bot_reply_count++;
+    notifyAppOfOwnChannelMsg(channel_idx, expanded, ts);
 #ifdef DISPLAY_CLASS
     mirrorOwnChannelMsg(channel_idx, expanded);
 #endif
@@ -212,7 +286,7 @@ void MyMesh::tryBotReplyChannel(uint8_t channel_idx, const char* text, uint8_t h
 // device to already have an active login session with this room server (see
 // NodePrefs::bot_room_prefix's doc comment) — otherwise sendMessage() still
 // "succeeds" locally but the server silently drops the unauthorized post.
-void MyMesh::tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops) {
+void MyMesh::tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   if (from.type != ADV_TYPE_ROOM) return;
   // bot_room_enabled is this target's own on/off switch — independent of
   // bot_enabled, same reasoning as tryBotReplyChannel above.
@@ -228,12 +302,15 @@ void MyMesh::tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_pref
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char expanded[BOT_SCRATCH];
+  char path[128];
+  botFormatPath(pkt, path, sizeof(path));
   expandMsg(_prefs.bot_reply_room, expanded, sizeof(expanded),
             sensors.node_lat, sensors.node_lon,
             sensors.node_lat != 0.0 || sensors.node_lon != 0.0,
             ts, _prefs.tz_offset_hours,
             &sensors, (float)board.getBattMilliVolts() / 1000.0f,
-            sender_name, hops);
+            sender_name, hops, pkt ? pkt->getSNR() : -999.0f,
+            pkt ? _radio->getLastRSSI() : -999.0f, path);
   // Anti-loop, mirrors the channel path: don't echo a message identical to
   // our own reply (e.g. re-synced back from the room server).
   if (strcmp(text, expanded) == 0) return;
@@ -243,7 +320,7 @@ void MyMesh::tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_pref
     _bot_last_room_reply_ms = millis();
     _bot_reply_count++;
 #ifdef DISPLAY_CLASS
-    if (_ui) _ui->addDMMsg(from.id.pub_key, true, expanded);
+    if (_listener) _listener->addDMMsg(from.id.pub_key, true, expanded);
 #endif
   }
 }
@@ -255,7 +332,32 @@ void MyMesh::tryBotReplyRoom(const ContactInfo& from, const uint8_t* sender_pref
 // expandMsg's placeholders, including {name}/{hops} if the sender wrote them
 // into a custom reply — not used by any of the built-in templates below today.
 bool MyMesh::botCommandReply(const char* cmd, const char* arg, const char* arg2, bool actions_allowed,
-                              uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name) {
+                              uint8_t hops, uint32_t ts, char* out, int out_len, const char* sender_name,
+                              const mesh::Packet* pkt, const ContactInfo* trace_target, uint8_t reply_kind,
+                              const uint8_t* reply_pubkey, uint8_t reply_channel_idx) {
+  if (!strcmp(cmd, "path")) {
+    char path[128];
+    botFormatPath(pkt, path, sizeof(path));
+    snprintf(out, out_len, "Path|%s", path);
+    return true;
+  }
+
+  if (!strcmp(cmd, "trace")) {
+    tickBotTrace();
+    if (_bot_trace_pending.active || _bot_trace_pending.queued) { snprintf(out, out_len, "Trace|busy"); return true; }
+    ContactInfo* target = arg[0] ? botFindContactPrefixCI(arg) : const_cast<ContactInfo*>(trace_target);
+    if (!target || target->type == ADV_TYPE_NONE) { snprintf(out, out_len, "Trace|contact-not-found"); return true; }
+    memset(&_bot_trace_pending, 0, sizeof(_bot_trace_pending));
+    _bot_trace_pending.queued = true;
+    _bot_trace_pending.reply_kind = reply_kind;
+    _bot_trace_pending.channel_idx = reply_channel_idx;
+    memcpy(_bot_trace_pending.target_pubkey, target->id.pub_key, PUB_KEY_SIZE);
+    snprintf(_bot_trace_pending.target_name, sizeof(_bot_trace_pending.target_name), "%s", target->name[0] ? target->name : "node");
+    if (reply_pubkey) memcpy(_bot_trace_pending.reply_pubkey, reply_pubkey, PUB_KEY_SIZE);
+    snprintf(out, out_len, "Trace|queued|%s", _bot_trace_pending.target_name);
+    return true;
+  }
+
   if (!strcmp(cmd, "hops")) {
     if (hops == 0) strncpy(out, "direct", out_len);     // heard directly (0 repeaters)
     else           snprintf(out, out_len, "%u hops", (unsigned)hops);
@@ -334,7 +436,7 @@ bool MyMesh::botCommandReply(const char* cmd, const char* arg, const char* arg2,
         bool off = !strcmp(arg, "off");
         if (!on && !off) { snprintf(out, out_len, "gpio%d: on|off?", idx); return true; }
         bool is_out = false, val = false;
-        if (_ui && _ui->botGetGPIO(idx, is_out, val) && is_out) {
+        if (_listener && _listener->botGetGPIO(idx, is_out, val) && is_out) {
           _bot_gpio_action[idx - 1] = on ? 1 : 0;   // deferred -- see applyPendingBotActions()
           snprintf(out, out_len, "gpio%d: %s", idx, on ? "on" : "off");
         } else {
@@ -344,9 +446,9 @@ bool MyMesh::botCommandReply(const char* cmd, const char* arg, const char* arg2,
       }
       int mv = 0;
       bool is_out = false, val = false;
-      if (_ui && _ui->botGetGPIOAnalog(idx, mv)) {
+      if (_listener && _listener->botGetGPIOAnalog(idx, mv)) {
         snprintf(out, out_len, "gpio%d: %dmV", idx, mv);
-      } else if (_ui && _ui->botGetGPIO(idx, is_out, val)) {
+      } else if (_listener && _listener->botGetGPIO(idx, is_out, val)) {
         snprintf(out, out_len, "gpio%d: %s %s", idx, is_out ? "out" : "in", val ? "on" : "off");
       } else {
         snprintf(out, out_len, "gpio%d: off", idx);
@@ -363,8 +465,8 @@ bool MyMesh::botCommandReply(const char* cmd, const char* arg, const char* arg2,
   else if (!strcmp(cmd, "temp"))   tmpl = "{temp}";
   else if (!strcmp(cmd, "status")) tmpl = "batt {batt} loc {loc} at {time}";
   else if (!strcmp(cmd, "help"))   tmpl = actions_allowed
-                                             ? "cmds: !ping !batt !loc !time !temp !hops !status !gps !buzz !advert !gpio1-4"
-                                             : "cmds: !ping !batt !loc !time !temp !hops !status";
+                                             ? "cmds: !ping !batt !loc !time !temp !hops !path !trace !status !gps !buzz !advert !gpio1-4"
+                                             : "cmds: !ping !batt !loc !time !temp !hops !path !trace !status";
   else return false;                             // unknown — let the trigger bot try
 
   expandMsg(tmpl, out, out_len,
@@ -383,7 +485,9 @@ bool MyMesh::botCommandReply(const char* cmd, const char* arg, const char* arg2,
 // actions_allowed gates the state-changing commands (!gps/!buzz/!advert) --
 // the read-only queries are always reachable once a target's Commands is on.
 int MyMesh::botScanCommands(const char* body, uint8_t hops, uint32_t ts, char* out, int out_len,
-                             const char* sender_name, bool actions_allowed) {
+                             const char* sender_name, bool actions_allowed, const mesh::Packet* pkt,
+                             const ContactInfo* trace_target, uint8_t reply_kind,
+                             const uint8_t* reply_pubkey, uint8_t reply_channel_idx) {
   resetPendingBotActions();   // pending actions/flags below are set by tokens in this scan;
                               // caller applies or clears them once it knows if the reply sent
   // Reads one space-delimited token at p into buf (lowercased, truncated to
@@ -425,7 +529,8 @@ int MyMesh::botScanCommands(const char* body, uint8_t hops, uint32_t ts, char* o
     }
 
     char seg[80];
-    if (!botCommandReply(cmd, arg1, arg2, actions_allowed, hops, ts, seg, sizeof(seg), sender_name)) continue;  // unknown
+    if (!botCommandReply(cmd, arg1, arg2, actions_allowed, hops, ts, seg, sizeof(seg), sender_name,
+                         pkt, trace_target, reply_kind, reply_pubkey, reply_channel_idx)) continue;  // unknown
 
     if (matched > 0 && oi + 3 < out_len) {        // " | " separator
       out[oi++] = ' '; out[oi++] = '|'; out[oi++] = ' ';
@@ -439,28 +544,100 @@ int MyMesh::botScanCommands(const char* body, uint8_t hops, uint32_t ts, char* o
   return matched;
 }
 
+void MyMesh::tickBotTrace() {
+  if (_bot_trace_pending.active && millis() - _bot_trace_pending.started_ms > 60000UL) {
+    clearPingResult(_bot_trace_pending.tag);
+    memset(&_bot_trace_pending, 0, sizeof(_bot_trace_pending));
+  }
+}
+
+bool MyMesh::botStartQueuedTrace() {
+  if (!_bot_trace_pending.queued) return true;
+  BotTracePending request = _bot_trace_pending;
+  uint32_t tag = sendPing(request.target_pubkey, 1);
+  if (!tag) {
+    memset(&_bot_trace_pending, 0, sizeof(_bot_trace_pending));
+    return false;
+  }
+  request.active = true;
+  request.queued = false;
+  request.tag = tag;
+  request.started_ms = millis();
+  _bot_trace_pending = request;
+  return true;
+}
+
+void MyMesh::botCancelQueuedTrace() {
+  if (_bot_trace_pending.queued) memset(&_bot_trace_pending, 0, sizeof(_bot_trace_pending));
+}
+
+void MyMesh::botCompleteTrace(uint32_t tag, const uint8_t* path_snrs, const uint8_t* path_hashes,
+                              uint8_t path_len, uint8_t flags, int16_t snr_out_x4,
+                              int16_t snr_back_x4, uint32_t rtt_ms) {
+  if (!_bot_trace_pending.active || _bot_trace_pending.tag != tag) return;
+  BotTracePending request = _bot_trace_pending;
+  memset(&_bot_trace_pending, 0, sizeof(_bot_trace_pending));
+
+  uint8_t hash_size = (uint8_t)(1U << (flags & 0x03));
+  char route[112];
+  botFormatTracePath(path_hashes, path_snrs, path_len, hash_size, route, sizeof(route));
+  char reply[BOT_SCRATCH];
+  snprintf(reply, sizeof(reply), "Trace|Path:%s|SNRout:%.1fdB|SNRback:%.1fdB|RTT:%ums", route,
+           snr_out_x4 / 4.0f, snr_back_x4 / 4.0f, (unsigned)rtt_ms);
+  uint32_t ts = getRTCClock()->getCurrentTime();
+  bool sent = false;
+
+  if (request.reply_kind == 2) {
+    ChannelDetails ch;
+    int len = strlen(reply);
+    if (getChannel(request.channel_idx, ch) && sendGroupMessage(ts, ch.channel, _prefs.node_name, reply, len)) {
+      sent = true;
+      notifyAppOfOwnChannelMsg(request.channel_idx, reply, ts);
+#ifdef DISPLAY_CLASS
+      mirrorOwnChannelMsg(request.channel_idx, reply);
+#endif
+      _bot_last_ch_reply_ms = millis();
+    }
+  } else {
+    ContactInfo* dest = lookupContactByPubKey(request.reply_pubkey, PUB_KEY_SIZE);
+    uint32_t expected_ack, est_timeout;
+    if (dest && sendMessage(*dest, ts, 0, reply, expected_ack, est_timeout) != MSG_SEND_FAILED) {
+      sent = true;
+      if (request.reply_kind == 1) botDmRecord(dest->id.pub_key);
+#ifdef DISPLAY_CLASS
+      if (_listener) _listener->addDMMsg(dest->id.pub_key, true, reply);
+#endif
+    }
+  }
+  if (sent) _bot_reply_count++;
+}
+
 // DM query commands. The reply is a pull, not a push, so it ignores quiet hours;
 // the per-contact throttle still applies. Returns true when at least one command
 // was found (replied or throttled), so the caller skips the trigger-reply path.
-bool MyMesh::tryBotCommand(const ContactInfo& from, const char* text, uint8_t hops) {
+bool MyMesh::tryBotCommand(const ContactInfo& from, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   if (!_prefs.bot_commands_enabled) return false;
   if (from.type != ADV_TYPE_CHAT) return false;
   if (!botDmSenderAllowed(from)) return false;
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char out[BOT_SCRATCH];
-  if (botScanCommands(text, hops, ts, out, sizeof(out), from.name, _prefs.bot_actions_dm != 0) == 0) return false;  // no commands
-  if (!botDmAllowed(from.id.pub_key)) { resetPendingBotActions(); return true; }  // throttled
+  if (botScanCommands(text, hops, ts, out, sizeof(out), from.name, _prefs.bot_actions_dm != 0,
+                      pkt, &from, 1, from.id.pub_key, 0) == 0) return false;  // no commands
+  if (!botDmAllowed(from.id.pub_key)) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }  // throttled
 
   uint32_t expected_ack, est_timeout;
   if (sendMessage(from, ts, 0, out, expected_ack, est_timeout) != MSG_SEND_FAILED) {
     botDmRecord(from.id.pub_key);
     _bot_reply_count++;
 #ifdef DISPLAY_CLASS
-    if (_ui) _ui->addDMMsg(from.id.pub_key, true, out);
+    if (_listener) _listener->addDMMsg(from.id.pub_key, true, out);
 #endif
     if (_locfix_requested) startLocFix(LOCFIX_DEST_CONTACT, from.id.pub_key, 0);
+    botStartQueuedTrace();
     applyPendingBotActions();
+  } else {
+    botCancelQueuedTrace();
   }
   resetPendingBotActions();
   return true;
@@ -469,7 +646,7 @@ bool MyMesh::tryBotCommand(const ContactInfo& from, const char* text, uint8_t ho
 // Channel query commands — only on the bot's monitored channel. The reply is
 // broadcast to everyone on the channel, so unlike DM commands it respects quiet
 // hours and uses the global per-channel cooldown (shared with the trigger reply).
-bool MyMesh::tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t hops) {
+bool MyMesh::tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   if (!(_prefs.bot_commands_ch && _prefs.bot_channel_enabled &&
         channel_idx == _prefs.bot_channel_idx))
     return false;
@@ -478,24 +655,30 @@ bool MyMesh::tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t
   const char* msg;
   char sender_name[32];
   botChannelSenderSplit(text, sender_name, sizeof(sender_name), &msg);
+  ContactInfo* trace_target = botFindContactPrefixCI(sender_name);
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char out[BOT_SCRATCH];
-  if (botScanCommands(msg, hops, ts, out, sizeof(out), sender_name, _prefs.bot_actions_ch != 0) == 0) return false;  // no commands
-  if (botInQuietHours()) { resetPendingBotActions(); return true; }                                       // quiet hours
-  if (millis() - _bot_last_ch_reply_ms <= BOT_REPLY_COOLDOWN_MS) { resetPendingBotActions(); return true; }  // throttled
+  if (botScanCommands(msg, hops, ts, out, sizeof(out), sender_name, _prefs.bot_actions_ch != 0,
+                      pkt, trace_target, 2, nullptr, channel_idx) == 0) return false;  // no commands
+  if (botInQuietHours()) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }                                       // quiet hours
+  if (millis() - _bot_last_ch_reply_ms <= BOT_REPLY_COOLDOWN_MS) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }  // throttled
 
   ChannelDetails ch;
-  if (!getChannel(channel_idx, ch)) { resetPendingBotActions(); return true; }
+  if (!getChannel(channel_idx, ch)) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }
   int rlen = strlen(out);
   if (sendGroupMessage(ts, ch.channel, _prefs.node_name, out, rlen)) {
     _bot_last_ch_reply_ms = millis();
     _bot_reply_count++;
+    notifyAppOfOwnChannelMsg(channel_idx, out, ts);
 #ifdef DISPLAY_CLASS
     mirrorOwnChannelMsg(channel_idx, out);
 #endif
     if (_locfix_requested) startLocFix(LOCFIX_DEST_CHANNEL, nullptr, channel_idx);
+    botStartQueuedTrace();
     applyPendingBotActions();
+  } else {
+    botCancelQueuedTrace();
   }
   resetPendingBotActions();
   return true;
@@ -504,7 +687,7 @@ bool MyMesh::tryBotChannelCommand(uint8_t channel_idx, const char* text, uint8_t
 // Room query commands — mirrors tryBotChannelCommand: the reply posts to the
 // room (visible to every member), so it respects quiet hours and the shared
 // per-room cooldown, unlike the DM command path's private-pull exemption.
-bool MyMesh::tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops) {
+bool MyMesh::tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_prefix, const char* text, uint8_t hops, const mesh::Packet* pkt) {
   if (from.type != ADV_TYPE_ROOM) return false;
   if (!(_prefs.bot_commands_room && _prefs.bot_room_enabled &&
         memcmp(from.id.pub_key, _prefs.bot_room_prefix, NodePrefs::FAVOURITE_PREFIX_LEN) == 0))
@@ -512,22 +695,27 @@ bool MyMesh::tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_pr
 
   char sender_name[32];
   botRoomSenderName(sender_prefix, sender_name, sizeof(sender_name));
+  ContactInfo* trace_target = sender_prefix ? lookupContactByPubKey(sender_prefix, 4) : nullptr;
 
   uint32_t ts = getRTCClock()->getCurrentTime();
   char out[BOT_SCRATCH];
-  if (botScanCommands(text, hops, ts, out, sizeof(out), sender_name, _prefs.bot_actions_room != 0) == 0) return false;  // no commands
-  if (botInQuietHours()) { resetPendingBotActions(); return true; }                          // quiet hours
-  if (millis() - _bot_last_room_reply_ms <= BOT_REPLY_COOLDOWN_MS) { resetPendingBotActions(); return true; }   // throttled
+  if (botScanCommands(text, hops, ts, out, sizeof(out), sender_name, _prefs.bot_actions_room != 0,
+                      pkt, trace_target, 3, from.id.pub_key, 0) == 0) return false;  // no commands
+  if (botInQuietHours()) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }                          // quiet hours
+  if (millis() - _bot_last_room_reply_ms <= BOT_REPLY_COOLDOWN_MS) { botCancelQueuedTrace(); resetPendingBotActions(); return true; }   // throttled
 
   uint32_t expected_ack, est_timeout;
   if (sendMessage(from, ts, 0, out, expected_ack, est_timeout) != MSG_SEND_FAILED) {
     _bot_last_room_reply_ms = millis();
     _bot_reply_count++;
 #ifdef DISPLAY_CLASS
-    if (_ui) _ui->addDMMsg(from.id.pub_key, true, out);
+    if (_listener) _listener->addDMMsg(from.id.pub_key, true, out);
 #endif
     if (_locfix_requested) startLocFix(LOCFIX_DEST_CONTACT, from.id.pub_key, 0);
+    botStartQueuedTrace();
     applyPendingBotActions();
+  } else {
+    botCancelQueuedTrace();
   }
   resetPendingBotActions();
   return true;
@@ -541,11 +729,11 @@ bool MyMesh::tryBotRoomCommand(const ContactInfo& from, const uint8_t* sender_pr
 // MyMesh.h). !gps fix's startLocFix() is armed separately by the caller (it
 // needs the destination, which this function doesn't have).
 void MyMesh::applyPendingBotActions() {
-  if (_bot_gps_action_pending && _ui) _ui->botSetGPS(_bot_gps_action_on);
-  if (_bot_buzz_action_secs > 0 && _ui) _ui->botBuzz(_bot_buzz_action_secs);
+  if (_bot_gps_action_pending && _listener) _listener->botSetGPS(_bot_gps_action_on);
+  if (_bot_buzz_action_secs > 0 && _listener) _listener->botBuzz(_bot_buzz_action_secs);
   if (_bot_advert_action_pending) advert();
   for (int i = 0; i < 4; i++) {
-    if (_bot_gpio_action[i] >= 0 && _ui) _ui->botSetGPIO(i + 1, _bot_gpio_action[i] != 0);
+    if (_bot_gpio_action[i] >= 0 && _listener) _listener->botSetGPIO(i + 1, _bot_gpio_action[i] != 0);
   }
 }
 
@@ -578,7 +766,7 @@ void MyMesh::startLocFix(uint8_t dest_type, const uint8_t* pub_key, uint8_t chan
   _loc_fix.averaging_until_ms = 0;
   _loc_fix.deadline_ms = futureMillis(_locfix_requested_timeout_ms);
   _loc_fix.gps_was_on = (_prefs.gps_enabled != 0);
-  if (!_loc_fix.gps_was_on && _ui) _ui->botSetGPS(true);
+  if (!_loc_fix.gps_was_on && _listener) _listener->botSetGPS(true);
 }
 
 // !gps fix state machine, ticked every MyMesh::loop() while _loc_fix.active.
@@ -627,7 +815,7 @@ void MyMesh::tickLocFix() {
   }
   sendLocFixResult(msg);
 
-  if (!_loc_fix.gps_was_on && _ui) _ui->botSetGPS(false);
+  if (!_loc_fix.gps_was_on && _listener) _listener->botSetGPS(false);
   _loc_fix.active = false;
 }
 
@@ -646,6 +834,7 @@ void MyMesh::sendLocFixResult(const char* msg) {
     if (sendGroupMessage(ts, ch.channel, _prefs.node_name, msg, mlen)) {
       _bot_last_ch_reply_ms = millis();
       _bot_reply_count++;
+      notifyAppOfOwnChannelMsg(_loc_fix.channel_idx, msg, ts);
 #ifdef DISPLAY_CLASS
       mirrorOwnChannelMsg(_loc_fix.channel_idx, msg);
 #endif
@@ -659,7 +848,7 @@ void MyMesh::sendLocFixResult(const char* msg) {
       else botDmRecord(c->id.pub_key);
       _bot_reply_count++;
 #ifdef DISPLAY_CLASS
-      if (_ui) _ui->addDMMsg(c->id.pub_key, true, msg);
+      if (_listener) _listener->addDMMsg(c->id.pub_key, true, msg);
 #endif
     }
   }
